@@ -532,7 +532,7 @@ if filename is None:
     raise ValueError("filename must be specified (valid hdf5 file)")
 
 constraint_animation_args=[]
-solver = qf.solve_poisson
+solve_function = qf.solve_poisson.solve
 # ---------- Externally defined code ----------
 
 {}
@@ -565,7 +565,7 @@ if cuda_available and mysim['hamiltonian'] is qf.solve_poisson and mysim['integr
 
 # Run simulation
 if not args.animate:
-    qf.solve(mysim,hamiltonian=solver.solve, **solve_kwargs)
+    qf.solve(mysim,hamiltonian=solve_function, **solve_kwargs)
 
 # Create animation
 if not args.simulate:

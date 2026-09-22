@@ -18,9 +18,10 @@ __all__ = [
     "CommutatorPoissonSolver",
     "ConstraintPlotter",
     "constraint_matrix",
+    "largest_eigenvector",
     "plotter",
+    "project_domain",
     "spectral_matrix",
-    "trace_free_block_projector",
 ]
 
 
@@ -106,6 +107,28 @@ def _materialize_commutator_rows(F, selected_row_indices):
 # Spectral construction
 
 
+def largest_eigenvector(W):
+    r"""Return :math:`1j\,e_i e_i^\dagger` for the largest mode.
+
+    QuFlow matrices are skew-Hermitian, so "largest" refers to the largest
+    real eigenvalue of ``-1j * W``.  One rank-one skew-Hermitian matrix is
+    returned even when the largest eigenvalue is repeated.  Leading batch axes
+    are allowed.
+    """
+
+    W = np.asarray(W)
+    if W.ndim < 2 or W.shape[-2] != W.shape[-1] or W.shape[-1] == 0:
+        raise ValueError(
+            f"W must end with nonempty square matrix axes, got {W.shape}."
+        )
+
+    _, eigenvectors = np.linalg.eigh(-1j * W)
+    eigenvector = eigenvectors[..., :, -1]
+    return 1j * (
+        eigenvector[..., :, None] * eigenvector[..., None, :].conj()
+    )
+
+
 def spectral_matrix(
     functions,
     level_sets,
@@ -115,6 +138,7 @@ def spectral_matrix(
     num_extra_eigenvectors=0,
     only_lowest=False,
     only_highest=False,
+    return_closest_eigenvalues=False,
 ):
     """Select spectral blocks and assign new eigenvalues.
 
@@ -125,6 +149,8 @@ def spectral_matrix(
     upward.  ``only_lowest=True`` or ``only_highest=True`` retains only the
     corresponding endpoint eigenvector of the resulting block.  If
     ``new_eigenvalues`` is omitted, each block retains its closest eigenvalue.
+    With ``return_closest_eigenvalues=True``, also return a list containing
+    the closest original eigenvalue for each function and level.
     """
     functions = tuple(np.asarray(F) for F in functions)
     level_sets = np.asarray(level_sets, dtype=float).ravel()
@@ -152,12 +178,14 @@ def spectral_matrix(
             )
 
     matrix = 0.0
+    closest_eigenvalues = []
     for function_index, (F, level, new_eigenvalue) in enumerate(
         zip(functions, level_sets, new_eigenvalues)
     ):
         eigenvalues, eigenvectors = np.linalg.eigh(-1j * F)
         closest_index = np.argmin(np.abs(eigenvalues - level))
         closest_eigenvalue = eigenvalues[closest_index]
+        closest_eigenvalues.append(closest_eigenvalue.item())
 
         if superlevel:
             keep = np.isclose(eigenvalues, closest_eigenvalue)
@@ -202,6 +230,8 @@ def spectral_matrix(
         )
         matrix = matrix + np.asarray(value)[..., None, None] * (U @ U.conj().T)
 
+    if return_closest_eigenvalues:
+        return matrix, closest_eigenvalues
     return matrix
 
 
@@ -213,12 +243,14 @@ def constraint_matrix(
     superlevel=False,
     new_eigenvalues=None,
 ):
-    """Construct a skew-Hermitian constraint matrix.
+    """Construct a skew-Hermitian constraint matrix and report its levels.
 
     Replacement eigenvalues default to distinct labels from 1 to 2.  In
     superlevel mode, every eigenvector from the closest eigenvalue upward gets
     the corresponding replacement value.  Set ``keep_eigenvalues=True`` to
-    use the closest original eigenvalues instead.
+    use the closest original eigenvalues instead.  Returns the constraint
+    matrix and a list containing the closest original eigenvalue for every
+    function and level pair.
     """
     functions = tuple(functions)
     if keep_eigenvalues and new_eigenvalues is not None:
@@ -227,112 +259,112 @@ def constraint_matrix(
         )
     if not keep_eigenvalues and new_eigenvalues is None:
         new_eigenvalues = np.linspace(1.0, 2.0, len(functions))
-    return 1j * spectral_matrix(
+    matrix, closest_eigenvalues = spectral_matrix(
         functions,
         level_sets,
         new_eigenvalues,
         superlevel=superlevel,
+        return_closest_eigenvalues=True,
     )
+    return 1j * matrix, closest_eigenvalues
 
 
-def trace_free_block_projector(
-    functions,
-    level_sets,
-    outside_values,
-    *,
-    num_extra_eigenvectors=0,
-    only_lowest=False,
-    only_highest=False,
-):
-    """Create a trace-free projector with prescribed spectral outside blocks.
+def _sum_prescribed_trace(prescribed_trace):
+    """Return a finite real scalar from one value or summed contributions."""
+    if isinstance(prescribed_trace, np.ndarray):
+        contributions = prescribed_trace
+    elif np.isscalar(prescribed_trace):
+        contributions = np.asarray(prescribed_trace)
+    else:
+        try:
+            contributions = np.asarray(tuple(prescribed_trace))
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "prescribed_trace must be a finite real scalar or an iterable "
+                "of finite real scalars."
+            ) from error
 
-    Each outside block begins at the eigenvalue closest to its paired level
-    and includes every larger eigenvalue.  Positive
-    ``num_extra_eigenvectors`` extends the block downward; negative values
-    move its boundary upward.  With ``only_lowest=True``, the prescribed value
-    is placed only on the eigenvector selected by that boundary shift and the
-    other outside eigenvectors are set to zero.  A negative shift does not
-    return the skipped eigenvectors to the complementary block.
-    ``only_highest=True`` similarly places the value only on the highest
-    eigenvector.  The two options are mutually exclusive.  The returned
-    callable removes trace through the complementary block.  Derived
-    projectors are assumed pairwise orthogonal.
-    """
-
-    functions = tuple(np.asarray(F) for F in functions)
-    level_sets = np.asarray(level_sets, dtype=float).ravel()
-    outside_values = tuple(outside_values)
-    if (
-        len(functions) != level_sets.size
-        or len(functions) != len(outside_values)
+    if contributions.ndim > 1 or not np.issubdtype(
+        contributions.dtype, np.number
     ):
         raise ValueError(
-            "functions, level_sets, and outside_values must have equal "
-            "lengths."
+            "prescribed_trace must be a finite real scalar or an iterable of "
+            "finite real scalars."
         )
+    if not np.isfinite(contributions).all():
+        raise ValueError("prescribed_trace values must be finite.")
+    if not np.isreal(contributions).all():
+        raise ValueError("prescribed_trace values must be real.")
+    if contributions.ndim == 0:
+        prescribed_trace = contributions.real.item()
+    else:
+        prescribed_trace = sum(contributions.real.tolist())
+    try:
+        finite_sum = np.isfinite(prescribed_trace)
+    except TypeError:
+        finite_sum = False
+    if not finite_sum:
+        raise ValueError("prescribed_trace values must have a finite sum.")
+    return prescribed_trace
+
+
+def project_domain(W, functions, level_sets, prescribed_trace=0.0):
+    """Project ``W`` and prescribe the imaginary part of its trace.
+
+    Each excluded block begins at the eigenvalue closest to its paired level
+    and includes every larger eigenvalue.  The excluded blocks and their cross
+    terms with the retained domain are set to zero.  The trace is adjusted
+    through the retained block.  Derived block projectors are assumed pairwise
+    orthogonal.  ``prescribed_trace`` is the desired imaginary part of the
+    result's trace.  It may be one finite real value or an iterable of finite
+    real contributions, which are summed first.  It defaults to zero.
+
+    ``W`` may be one square matrix or a batch whose final two axes are square.
+    """
+
+    W = np.asarray(W)
+    if W.ndim < 2 or W.shape[-2] != W.shape[-1]:
+        raise ValueError(f"W must end with square matrix axes, got {W.shape}.")
+
+    prescribed_trace = _sum_prescribed_trace(prescribed_trace)
+    functions = tuple(np.asarray(F) for F in functions)
+    level_sets = np.asarray(level_sets, dtype=float).ravel()
+    if len(functions) != level_sets.size:
+        raise ValueError("functions and level_sets must have equal lengths.")
     if not np.isfinite(level_sets).all():
         raise ValueError("level_sets must be finite real values.")
-    if only_lowest and only_highest:
-        raise ValueError("only_lowest and only_highest cannot both be True")
-
-    matrix_shape = functions[0].shape if functions else None
-    if functions:
-        projector_extra_eigenvectors = (
-            max(num_extra_eigenvectors, 0)
-            if only_lowest or only_highest
-            else num_extra_eigenvectors
+    if any(F.shape != W.shape[-2:] for F in functions):
+        raise ValueError(
+            f"functions must have the same matrix shape as W, {W.shape[-2:]}."
         )
-        outside_projector = spectral_matrix(
+
+    if functions:
+        excluded_projector = spectral_matrix(
             functions,
             level_sets,
             1.0,
             superlevel=True,
-            num_extra_eigenvectors=projector_extra_eigenvectors,
-        )
-        outside_values = tuple(
-            value if np.iscomplexobj(value) else 1j * np.asarray(value)
-            for value in outside_values
-        )
-        outside_matrix = spectral_matrix(
-            functions,
-            level_sets,
-            outside_values,
-            superlevel=True,
-            num_extra_eigenvectors=num_extra_eigenvectors,
-            only_lowest=only_lowest,
-            only_highest=only_highest,
         )
     else:
-        outside_projector = 0.0
-        outside_matrix = 0.0
+        excluded_projector = 0.0
 
-    def project(W):
-        W = np.asarray(W)
-        if W.ndim < 2 or W.shape[-2] != W.shape[-1]:
-            raise ValueError(
-                f"W must end with square matrix axes, got {W.shape}."
-            )
-        if matrix_shape is not None and W.shape[-2:] != matrix_shape:
-            raise ValueError(
-                f"W must end with shape {matrix_shape}, got {W.shape}."
-            )
-        identity = np.eye(W.shape[-1], dtype=W.dtype)
-        water_projector = identity - outside_projector
-        projected = water_projector @ W @ water_projector + outside_matrix
+    identity = np.eye(W.shape[-1], dtype=W.dtype)
+    domain_projector = identity - excluded_projector
+    projected = domain_projector @ W @ domain_projector
 
-        trace = np.trace(projected, axis1=-2, axis2=-1)
-        water_rank = np.trace(water_projector)
-        if np.isclose(water_rank, 0.0, rtol=1e-12, atol=1e-12):
-            if np.allclose(trace, 0.0, rtol=1e-12, atol=1e-12):
-                return projected
+    domain_rank = np.trace(domain_projector)
+    if np.isclose(domain_rank, 0.0, rtol=1e-12, atol=1e-12):
+        if prescribed_trace != 0.0:
             raise ValueError(
-                "Cannot preserve the outside values and make the result "
-                "trace-free because the outside blocks span the full "
-                "matrix space."
+                "Cannot prescribe a nonzero trace because the excluded "
+                "blocks span the full matrix space."
             )
-        return projected - (trace / water_rank)[..., None, None] * water_projector
+        return np.zeros_like(projected)
 
-    return project
+    trace = np.trace(projected, axis1=-2, axis2=-1)
+    target_trace = 0.0 if prescribed_trace == 0.0 else 1j * prescribed_trace
+    trace_shift = np.asarray((target_trace - trace) / domain_rank)
+    return projected + trace_shift[..., None, None] * domain_projector
 
 
 # Constraint-aware plotting
@@ -348,9 +380,7 @@ class ConstraintPlotter:
 
     ``subtract_function`` is interpreted as a fixed field.  If it is
     callable, it is evaluated once on a zero array shaped like the first
-    constraint function.  This makes it possible to pass the affine callable
-    returned by :func:`trace_free_block_projector`; only its constant part is
-    removed, rather than applying the projector to every animation frame.
+    constraint function.
 
     Plotting uses at least ``min_N=256`` samples in latitude (and ``2*N-1``
     in longitude).  Above that floor, ``N`` is inherited from the plotted
@@ -620,10 +650,9 @@ def plotter(
 
     Examples
     --------
-    ``project`` may be the callable returned by
-    :func:`trace_free_block_projector`::
+    Create one plotter and reuse it for every state::
 
-        cplot = plotter(functions, level_sets, project, N=N)
+        cplot = plotter(functions, level_sets, N=N)
         cplot(W0)
 
         with qf.Animation("simulation.mp4", plotter=cplot) as animation:
