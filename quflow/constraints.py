@@ -20,6 +20,7 @@ __all__ = [
     "constraint_matrix",
     "largest_eigenvector",
     "plotter",
+    "project_commutator",
     "project_domain",
     "spectral_matrix",
 ]
@@ -102,6 +103,270 @@ def _materialize_commutator_rows(F, selected_row_indices):
     selected_rows.sum_duplicates()
     selected_rows.eliminate_zeros()
     return selected_rows
+
+
+def _orthonormal_eigenvector_columns(eigenvectors):
+    """Return orthonormal vectors as columns of an ``N x K`` matrix.
+
+    A two-dimensional NumPy array follows the eigensolver convention and is
+    interpreted column-wise.  A list or other iterable may instead contain
+    one one-dimensional vector per item.
+    """
+    if eigenvectors is None:
+        raise ValueError("eigenvectors must be a nonempty iterable of vectors.")
+
+    input_is_array = isinstance(eigenvectors, np.ndarray)
+    if input_is_array:
+        array = np.asarray(eigenvectors)
+        if array.ndim == 1:
+            eigenvector_matrix = array[:, np.newaxis]
+        elif array.ndim == 2:
+            eigenvector_matrix = array
+        else:
+            raise ValueError(
+                "eigenvectors must be a one-dimensional vector, an N-by-K "
+                "array, or an iterable of one-dimensional vectors."
+            )
+    else:
+        try:
+            vectors = tuple(eigenvectors)
+        except TypeError as error:
+            raise ValueError(
+                "eigenvectors must be a nonempty iterable of vectors."
+            ) from error
+        if not vectors:
+            raise ValueError(
+                "eigenvectors must be a nonempty iterable of vectors."
+            )
+        vectors = tuple(np.asarray(vector) for vector in vectors)
+        if any(vector.ndim != 1 for vector in vectors):
+            raise ValueError("Each eigenvector must be one-dimensional.")
+        if any(vector.size != vectors[0].size for vector in vectors):
+            raise ValueError("Eigenvectors must all have the same length.")
+        eigenvector_matrix = np.column_stack(vectors)
+
+    N, K = eigenvector_matrix.shape
+    if N == 0 or K == 0:
+        raise ValueError(
+            "eigenvectors must be a nonempty iterable of vectors."
+        )
+    if K > N:
+        raise ValueError(
+            f"At most {N} orthonormal eigenvectors can be supplied, got {K}."
+        )
+
+    dtype = np.result_type(eigenvector_matrix.dtype, np.complex128)
+    eigenvector_matrix = eigenvector_matrix.astype(dtype, copy=False)
+    if not np.isfinite(eigenvector_matrix).all():
+        raise ValueError("eigenvectors must contain only finite values.")
+
+    gram = eigenvector_matrix.conj().T @ eigenvector_matrix
+    identity = np.eye(K, dtype=dtype)
+    if not np.allclose(gram, identity, rtol=1e-10, atol=1e-12):
+        defect = float(np.max(np.abs(gram - identity)))
+        raise ValueError(
+            "eigenvectors must be orthonormal; the largest Gram-matrix "
+            f"error is {defect:.3e}."
+        )
+    return eigenvector_matrix
+
+
+class _EigenvectorConstraintOperator(spla.LinearOperator):
+    r"""Matrix-free constraints induced by distinct active eigenvectors.
+
+    If ``E`` contains the active eigenvectors and ``Q`` spans their
+    orthogonal complement, set ``A = [E, Q]``.  The operator extracts the
+    entries of ``A^* X A`` which touch an active coordinate, except for the
+    active diagonal.  Its rows are orthonormal and its null space consists of
+    the matrices which preserve every active eigendirection and their common
+    complementary eigenspace.
+    """
+
+    def __init__(self, active_eigenvectors):
+        active_eigenvectors = np.asarray(active_eigenvectors)
+        N, K = active_eigenvectors.shape
+        complement = scipy.linalg.null_space(active_eigenvectors.conj().T)
+        if complement.shape != (N, N - K):
+            raise RuntimeError(
+                "Could not construct the orthogonal eigenvector complement."
+            )
+
+        self.active_eigenvectors = active_eigenvectors
+        self.complement_eigenvectors = complement
+        self.eigenbasis = np.column_stack(
+            (active_eigenvectors, complement)
+        )
+        self.matrix_size = N
+        self.num_active_eigenvalues = K
+
+        upper_rows, upper_columns = np.triu_indices(N, k=1)
+        keep = upper_rows < K
+        self._upper_rows = upper_rows[keep]
+        self._upper_columns = upper_columns[keep]
+        self.half_rank = self._upper_rows.size
+        rank = 2 * self.half_rank
+        expected_rank = K * (2 * N - K - 1)
+        if rank != expected_rank:
+            raise RuntimeError(
+                f"Constructed constraint rank {rank}, expected {expected_rank}."
+            )
+
+        dtype = np.dtype(
+            np.result_type(active_eigenvectors.dtype, np.complex128)
+        )
+        super().__init__(dtype=dtype, shape=(rank, N**2))
+
+    def _as_matrix(self, vector):
+        vector = np.asarray(vector, dtype=self.dtype)
+        if vector.size != self.matrix_size**2:
+            raise ValueError(
+                f"Expected {self.matrix_size**2} matrix entries, "
+                f"got {vector.size}."
+            )
+        return vector.reshape(self.matrix_size, self.matrix_size)
+
+    def _as_multipliers(self, multipliers):
+        multipliers = np.asarray(multipliers, dtype=self.dtype).ravel()
+        if multipliers.size != self.shape[0]:
+            raise ValueError(
+                f"Expected {self.shape[0]} constraint multipliers, "
+                f"got {multipliers.size}."
+            )
+        return multipliers
+
+    def _matvec(self, vector):
+        """Apply the full complex-linear constraint operator."""
+        matrix = self._as_matrix(vector)
+        E = self.active_eigenvectors
+        A = self.eigenbasis
+        rows = self._upper_rows
+        columns = self._upper_columns
+
+        # Parenthesization keeps both products O(K N^2), rather than O(N^3)
+        # when K is small.
+        active_rows = (E.conj().T @ matrix) @ A
+        active_columns = A.conj().T @ (matrix @ E)
+        upper = active_rows[rows, columns]
+        lower = active_columns[columns, rows]
+        return np.concatenate((upper, lower))
+
+    def _rmatvec(self, multipliers):
+        """Apply the adjoint of the full complex-linear operator."""
+        multipliers = self._as_multipliers(multipliers)
+        N = self.matrix_size
+        K = self.num_active_eigenvalues
+        half_rank = self.half_rank
+        rows = self._upper_rows
+        columns = self._upper_columns
+        upper = multipliers[:half_rank]
+        lower = multipliers[half_rank:]
+
+        # In eigenbasis coordinates the multiplier matrix is supported in
+        # the first K rows and columns.  Keep that low-rank structure through
+        # the change of basis instead of forming A @ Y @ A.H densely.
+        top = np.zeros((K, N), dtype=self.dtype)
+        top[rows, columns] = upper
+
+        active_lower = columns < K
+        top[columns[active_lower], rows[active_lower]] = lower[active_lower]
+
+        E = self.active_eigenvectors
+        A = self.eigenbasis
+        result = E @ (top @ A.conj().T)
+        if K < N:
+            bottom_left = np.zeros((N - K, K), dtype=self.dtype)
+            bottom_left[
+                columns[~active_lower] - K, rows[~active_lower]
+            ] = lower[~active_lower]
+            Q = self.complement_eigenvectors
+            result += (Q @ bottom_left) @ E.conj().T
+        return result.ravel()
+
+    def matvec_skew_hermitian(self, matrix):
+        """Apply the constraint using one triangle of a skew-Hermitian input."""
+        matrix = self._as_matrix(matrix)
+        E = self.active_eigenvectors
+        A = self.eigenbasis
+        rows = self._upper_rows
+        columns = self._upper_columns
+
+        active_columns = A.conj().T @ (matrix @ E)
+        lower = active_columns[columns, rows]
+        upper = -lower.conj()
+        return np.concatenate((upper, lower))
+
+    def rmatvec_skew_hermitian(self, multipliers):
+        """Apply the adjoint on the skew-Hermitian multiplier subspace."""
+        multipliers = self._as_multipliers(multipliers)
+        half_rank = self.half_rank
+        upper = multipliers[:half_rank]
+        lower = multipliers[half_rank:]
+
+        # Project away roundoff that violates upper = -conj(lower).  If R is
+        # the strictly-lower part in eigenbasis coordinates, the full matrix
+        # is R - R.H, so only one change-of-basis product is required.
+        lower = 0.5 * (lower - upper.conj())
+        lower_coordinates = np.zeros(
+            (self.matrix_size, self.num_active_eigenvalues), dtype=self.dtype
+        )
+        lower_coordinates[self._upper_columns, self._upper_rows] = lower
+        transformed_lower = (
+            self.eigenbasis @ lower_coordinates
+        ) @ self.active_eigenvectors.conj().T
+        result = transformed_lower - transformed_lower.conj().T
+        return result.ravel()
+
+
+def project_commutator(W, eigenvectors):
+    r"""Project ``W`` onto the commutant defined by active eigenvectors.
+
+    The columns of an ``N x K`` array ``eigenvectors`` are interpreted as
+    orthonormal eigenvectors with distinct nonzero eigenvalues; a list of
+    one-dimensional vectors is also accepted.  Their orthogonal complement
+    is the remaining, repeated zero eigenspace.  If ``E`` contains the active
+    vectors and ``R = I - E E^*``, the Hilbert--Schmidt projection is
+
+    .. math::
+
+        W \longmapsto R W R
+        + \sum_{j=1}^K e_j e_j^* W e_j e_j^*.
+
+    Only the eigenspaces matter, so the distinct labels ``1, ..., K`` do not
+    need to be formed explicitly.  The calculation uses thin ``N x K``
+    products and does not construct an orthogonal-complement basis.
+    """
+    W = np.asarray(W)
+    if W.ndim != 2 or W.shape[0] != W.shape[1] or W.shape[0] == 0:
+        raise ValueError(f"W must be a nonempty square matrix, got {W.shape}.")
+
+    E = _orthonormal_eigenvector_columns(eigenvectors)
+    N, K = E.shape
+    if W.shape != (N, N):
+        raise ValueError(
+            f"W and eigenvectors must have the same matrix size; got "
+            f"W.shape={W.shape} and eigenvectors with length {N}."
+        )
+
+    dtype = np.result_type(W.dtype, E.dtype, np.complex128)
+    W = W.astype(dtype, copy=False)
+    E = E.astype(dtype, copy=False)
+
+    active_rows = E.conj().T @ W
+    active_columns = W @ E
+    active_block = active_rows @ E
+
+    # R W R + E diag(diag(E.H W E)) E.H, expanded without forming R.
+    active_and_diagonal = active_block.copy()
+    diagonal_indices = np.arange(K)
+    active_and_diagonal[diagonal_indices, diagonal_indices] += np.diag(
+        active_block
+    )
+    return (
+        W
+        - E @ active_rows
+        - active_columns @ E.conj().T
+        + (E @ active_and_diagonal) @ E.conj().T
+    )
 
 
 # Spectral construction
@@ -677,11 +942,94 @@ class CommutatorPoissonSolver:
 
     A positive active count ``K`` assumes ``K`` distinct nonzero eigenvalues
     and an ``(N-K)``-fold zero eigenvalue.  Pass zero to detect the rank
-    numerically.  Construction briefly selects QuFlow's generic Poisson mode
-    and is not thread-safe with concurrent Poisson calls.
+    numerically.  Alternatively, pass ``eigenvectors=[e_1, ..., e_K]`` to
+    construct the same distinct-active-mode constraint directly, without an
+    interpolative decomposition or a stored constraint matrix.  Construction
+    briefly selects QuFlow's generic Poisson mode and is not thread-safe with
+    concurrent Poisson calls.
     """
 
-    def __init__(self, constraint_matrix, num_active_eigenvalues, rng=None):
+    def __init__(
+        self,
+        constraint_matrix=None,
+        num_active_eigenvalues=None,
+        rng=None,
+        *,
+        eigenvectors=None,
+    ):
+        if eigenvectors is not None and constraint_matrix is not None:
+            raise ValueError(
+                "Pass either constraint_matrix or eigenvectors, not both."
+            )
+
+        if eigenvectors is not None:
+            active_eigenvectors = _orthonormal_eigenvector_columns(eigenvectors)
+            N, K = active_eigenvectors.shape
+
+            if num_active_eigenvalues is not None:
+                count_error = (
+                    "num_active_eigenvalues must equal the number of supplied "
+                    f"eigenvectors ({K}), got {num_active_eigenvalues}."
+                )
+                try:
+                    supplied_count = int(num_active_eigenvalues)
+                except (TypeError, ValueError, OverflowError) as error:
+                    raise ValueError(count_error) from error
+                if (
+                    np.ndim(num_active_eigenvalues) != 0
+                    or supplied_count != num_active_eigenvalues
+                    or supplied_count != K
+                ):
+                    raise ValueError(count_error)
+
+            self.matrix_size = N
+            self.num_active_eigenvalues = K
+            self.rng = np.random.default_rng(rng)
+            self.constraint_rank = K * (2 * N - K - 1)
+            self.constraint_operator = _EigenvectorConstraintOperator(
+                active_eigenvectors
+            )
+            # Keep the established attribute name, but deliberately store a
+            # LinearOperator rather than an r-by-N^2 matrix in this mode.
+            self.constraint_row_basis = self.constraint_operator
+            self.constraint_eigenvectors = active_eigenvectors
+            self._uses_eigenvector_constraints = True
+        else:
+            if constraint_matrix is None:
+                raise ValueError(
+                    "Pass a constraint_matrix and num_active_eigenvalues, or "
+                    "pass eigenvectors."
+                )
+            self._initialize_matrix_constraints(
+                constraint_matrix, num_active_eigenvalues, rng
+            )
+
+        num_rows = self.constraint_operator.shape[0]
+        print(
+            f"CommutatorPoissonSolver: retained {num_rows} constraint rows.",
+            flush=True,
+        )
+        self._factor_schur_complement()
+
+    @classmethod
+    def from_eigenvectors(cls, eigenvectors):
+        """Construct a solver directly from an iterable of active vectors."""
+        return cls(eigenvectors=eigenvectors)
+
+    def __setstate__(self, state):
+        """Restore operator attributes missing from older solver pickles."""
+        self.__dict__.update(state)
+        if "constraint_operator" not in state:
+            self.constraint_operator = spla.aslinearoperator(
+                self.constraint_row_basis.astype(complex, copy=False)
+            )
+        if "_uses_eigenvector_constraints" not in state:
+            self._uses_eigenvector_constraints = False
+
+    def _initialize_matrix_constraints(
+        self, constraint_matrix, num_active_eigenvalues, rng
+    ):
+        """Initialize the backward-compatible commutator/ID construction."""
         constraint_matrix = np.asarray(constraint_matrix)
         shape = constraint_matrix.shape
         if len(shape) != 2 or shape[0] != shape[1]:
@@ -712,12 +1060,10 @@ class CommutatorPoissonSolver:
         self.constraint_row_basis = self._select_constraint_row_basis(
             constraint_matrix
         )
-        num_rows = self.constraint_row_basis.shape[0]
-        print(
-            f"CommutatorPoissonSolver: retained {num_rows} constraint rows.",
-            flush=True,
+        self.constraint_operator = spla.aslinearoperator(
+            self.constraint_row_basis.astype(complex, copy=False)
         )
-        self._factor_schur_complement()
+        self._uses_eigenvector_constraints = False
 
     def _select_constraint_row_basis(self, constraint_matrix):
         """Select normalized independent rows of the commutator."""
@@ -787,18 +1133,22 @@ class CommutatorPoissonSolver:
             return
 
         N = self.matrix_size
-        V = self.constraint_row_basis.astype(complex, copy=False)
+        V = self.constraint_operator
         schur = np.empty(
             (self.constraint_rank, self.constraint_rank), dtype=complex
         )
+        coordinate = np.zeros(self.constraint_rank, dtype=complex)
 
         previous_mode = qf.laplacian.cpu.select_skewherm(False)
         try:
             for column in range(self.constraint_rank):
-                P = qf.solve_poisson(
-                    V.getrow(column).conj().toarray().reshape(N, N)
-                )
-                schur[:, column] = -(V @ P.ravel())
+                coordinate[column] = 1.0
+                poisson_right_hand_side = np.asarray(
+                    V.rmatvec(coordinate)
+                ).reshape(N, N)
+                P = qf.solve_poisson(poisson_right_hand_side)
+                schur[:, column] = -np.asarray(V.matvec(P.ravel())).ravel()
+                coordinate[column] = 0.0
         finally:
             qf.laplacian.cpu.select_skewherm(previous_mode)
 
@@ -815,12 +1165,21 @@ class CommutatorPoissonSolver:
         P = qf.solve_poisson(W)
 
         if self.constraint_rank:
-            V = self.constraint_row_basis
-            schur_rhs = V @ P.ravel()
+            V = self.constraint_operator
+            use_skew_shortcut = self._uses_eigenvector_constraints and np.allclose(
+                W.conj().T, -W, rtol=1e-10, atol=1e-12
+            )
+            if use_skew_shortcut:
+                schur_rhs = V.matvec_skew_hermitian(P)
+            else:
+                schur_rhs = np.asarray(V.matvec(P.ravel())).ravel()
             multipliers = scipy.linalg.lu_solve(
                 self._schur_factorization, -schur_rhs
             )
-            correction = (V.conj().T @ multipliers).reshape(N, N)
+            if use_skew_shortcut:
+                correction = V.rmatvec_skew_hermitian(multipliers).reshape(N, N)
+            else:
+                correction = np.asarray(V.rmatvec(multipliers)).reshape(N, N)
             P = qf.solve_poisson(W - correction)
 
         return P
