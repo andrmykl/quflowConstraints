@@ -13,11 +13,14 @@ import scipy.sparse.linalg as spla
 
 import quflow as qf
 
+from .svg_domain import import_svg_domain
+
 
 __all__ = [
     "CommutatorPoissonSolver",
     "ConstraintPlotter",
     "constraint_matrix",
+    "import_svg_domain",
     "largest_eigenvector",
     "plotter",
     "project_commutator",
@@ -573,16 +576,213 @@ def _sum_prescribed_trace(prescribed_trace):
     return prescribed_trace
 
 
-def project_domain(W, functions, level_sets, prescribed_trace=0.0):
+def _validate_min_eigenvalue_magnitude(min_eigenvalue_magnitude):
+    """Return a validated nonnegative eigenvalue floor or ``None``."""
+    if min_eigenvalue_magnitude is None:
+        return None
+
+    value = np.asarray(min_eigenvalue_magnitude)
+    if (
+        value.ndim != 0
+        or np.iscomplexobj(value)
+        or value.dtype.kind not in "biuf"
+        or value.dtype.kind == "b"
+    ):
+        raise ValueError(
+            "min_eigenvalue_magnitude must be a finite nonnegative real scalar."
+        )
+
+    value = float(value)
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError(
+            "min_eigenvalue_magnitude must be a finite nonnegative real scalar."
+        )
+    return value
+
+
+def _trace_preserving_eigenvalue_floor(
+    eigenvalues,
+    minimum_magnitude,
+    zero_tolerance,
+):
+    """Floor nonzero signed eigenvalues while preserving their sum.
+
+    Numerical zeros, the signs of nonzero eigenvalues, and the total sum are
+    fixed.  Among spectra satisfying those constraints, this computes the
+    Euclidean-nearest one whose nonzero magnitudes are at least the requested
+    floor.
+    """
+    active = np.abs(eigenvalues) > zero_tolerance
+    adjusted = np.zeros_like(eigenvalues)
+    if not np.any(active):
+        return adjusted
+
+    values = eigenvalues[active]
+    positive = values > 0.0
+    negative = ~positive
+    target_sum = eigenvalues.sum()
+    value_scale = max(
+        abs(float(target_sum)),
+        float(np.max(np.abs(values), initial=0.0)),
+        minimum_magnitude * values.size,
+        np.finfo(eigenvalues.dtype).tiny,
+    )
+    feasibility_tolerance = (
+        64.0 * np.finfo(eigenvalues.dtype).eps * value_scale
+    )
+
+    minimum_sum = positive.sum() * minimum_magnitude
+    maximum_sum = -negative.sum() * minimum_magnitude
+    if (
+        not np.any(negative)
+        and target_sum < minimum_sum - feasibility_tolerance
+    ):
+        raise ValueError(
+            "min_eigenvalue_magnitude is incompatible with the prescribed "
+            "trace while preserving the nonzero eigenspace and eigenvalue signs."
+        )
+    if (
+        not np.any(positive)
+        and target_sum > maximum_sum + feasibility_tolerance
+    ):
+        raise ValueError(
+            "min_eigenvalue_magnitude is incompatible with the prescribed "
+            "trace while preserving the nonzero eigenspace and eigenvalue signs."
+        )
+
+    def shifted_and_floored(shift):
+        shifted = values - shift
+        return np.where(
+            positive,
+            np.maximum(shifted, minimum_magnitude),
+            np.minimum(shifted, -minimum_magnitude),
+        )
+
+    width = value_scale
+    lower_shift = -width
+    upper_shift = width
+    for _ in range(64):
+        if shifted_and_floored(lower_shift).sum() >= target_sum:
+            break
+        width *= 2.0
+        lower_shift = -width
+    for _ in range(64):
+        if shifted_and_floored(upper_shift).sum() <= target_sum:
+            break
+        width *= 2.0
+        upper_shift = width
+
+    # The constrained sum is monotone in the common Lagrange-multiplier
+    # shift.  Bisection is robust both when positive and negative eigenvalues
+    # are present and when a one-sided spectrum lands on the floor plateau.
+    for _ in range(100):
+        midpoint = 0.5 * (lower_shift + upper_shift)
+        if shifted_and_floored(midpoint).sum() > target_sum:
+            lower_shift = midpoint
+        else:
+            upper_shift = midpoint
+
+    floored = shifted_and_floored(0.5 * (lower_shift + upper_shift))
+    residual = target_sum - floored.sum()
+    if residual > 0.0 and np.any(positive):
+        floored[np.flatnonzero(positive)[0]] += residual
+    elif residual < 0.0 and np.any(negative):
+        floored[np.flatnonzero(negative)[0]] += residual
+    elif residual > 0.0:
+        # A negative-only spectrum can move toward zero until it reaches the
+        # floor.  This branch only corrects final bisection roundoff.
+        for value_index in np.flatnonzero(negative):
+            correction = min(
+                residual,
+                -minimum_magnitude - floored[value_index],
+            )
+            floored[value_index] += correction
+            residual -= correction
+            if residual <= 0.0:
+                break
+    elif residual < 0.0:
+        # Likewise, a positive-only spectrum can move down to the floor.
+        for value_index in np.flatnonzero(positive):
+            correction = max(
+                residual,
+                minimum_magnitude - floored[value_index],
+            )
+            floored[value_index] += correction
+            residual -= correction
+            if residual >= 0.0:
+                break
+
+    adjusted[active] = floored
+    return adjusted
+
+
+def _floor_projected_eigenvalues(projected, minimum_magnitude):
+    """Apply a trace-preserving spectral floor to skew-Hermitian matrices."""
+    if minimum_magnitude == 0.0:
+        return projected
+
+    adjoint = projected.swapaxes(-1, -2).conj()
+    skew_residual = projected + adjoint
+    matrix_size = projected.shape[-1]
+    real_dtype = np.asarray(projected.real).dtype
+    eps = np.finfo(real_dtype).eps
+    matrix_scale = np.max(np.abs(projected), axis=(-2, -1), initial=0.0)
+    skew_tolerance = 100.0 * eps * matrix_size * matrix_scale
+    residual_size = np.max(
+        np.abs(skew_residual), axis=(-2, -1), initial=0.0
+    )
+    if np.any(residual_size > skew_tolerance):
+        raise ValueError(
+            "min_eigenvalue_magnitude requires the projected matrix to be "
+            "skew-Hermitian."
+        )
+
+    hermitian = -0.5j * (projected - adjoint)
+    eigenvalues, eigenvectors = np.linalg.eigh(hermitian)
+    flat_eigenvalues = eigenvalues.reshape(-1, matrix_size)
+    adjusted_eigenvalues = np.empty_like(flat_eigenvalues)
+    for index, values in enumerate(flat_eigenvalues):
+        spectral_scale = np.max(np.abs(values), initial=0.0)
+        zero_tolerance = 10.0 * eps * matrix_size * spectral_scale
+        adjusted_eigenvalues[index] = _trace_preserving_eigenvalue_floor(
+            values,
+            minimum_magnitude,
+            zero_tolerance,
+        )
+
+    adjusted_eigenvalues = adjusted_eigenvalues.reshape(eigenvalues.shape)
+    floored_hermitian = (
+        eigenvectors * adjusted_eigenvalues[..., np.newaxis, :]
+    ) @ eigenvectors.swapaxes(-1, -2).conj()
+    return 1j * floored_hermitian
+
+
+def project_domain(
+    W,
+    functions,
+    level_sets,
+    prescribed_trace=0.0,
+    *,
+    include_boundary=False,
+    min_eigenvalue_magnitude=None,
+):
     """Project ``W`` and prescribe the imaginary part of its trace.
 
-    Each excluded block begins at the eigenvalue closest to its paired level
-    and includes every larger eigenvalue.  The excluded blocks and their cross
-    terms with the retained domain are set to zero.  The trace is adjusted
-    through the retained block.  Derived block projectors are assumed pairwise
-    orthogonal.  ``prescribed_trace`` is the desired imaginary part of the
-    result's trace.  It may be one finite real value or an iterable of finite
-    real contributions, which are summed first.  It defaults to zero.
+    By default, each excluded block begins at the eigenvalue closest to its
+    paired level and includes every larger eigenvalue.  Set
+    ``include_boundary=True`` to retain the entire closest-eigenvalue
+    eigenspace and exclude only eigenvectors with genuinely larger
+    eigenvalues.  The excluded blocks and their cross terms with the retained
+    domain are set to zero.  The trace is adjusted through the retained block.
+    Set ``min_eigenvalue_magnitude`` to a positive number to preserve the
+    numerical zero eigenspace while ensuring that every nonzero eigenvalue has
+    at least that magnitude.  This spectral adjustment also preserves the
+    eigenvalue signs and prescribed trace; a ``ValueError`` is raised when
+    those requirements are incompatible.
+    Derived block projectors are assumed pairwise orthogonal.
+    ``prescribed_trace`` is the desired imaginary part of the result's trace.
+    It may be one finite real value or an iterable of finite real
+    contributions, which are summed first.  It defaults to zero.
 
     ``W`` may be one square matrix or a batch whose final two axes are square.
     """
@@ -592,6 +792,9 @@ def project_domain(W, functions, level_sets, prescribed_trace=0.0):
         raise ValueError(f"W must end with square matrix axes, got {W.shape}.")
 
     prescribed_trace = _sum_prescribed_trace(prescribed_trace)
+    min_eigenvalue_magnitude = _validate_min_eigenvalue_magnitude(
+        min_eigenvalue_magnitude
+    )
     functions = tuple(np.asarray(F) for F in functions)
     level_sets = np.asarray(level_sets, dtype=float).ravel()
     if len(functions) != level_sets.size:
@@ -603,7 +806,17 @@ def project_domain(W, functions, level_sets, prescribed_trace=0.0):
             f"functions must have the same matrix shape as W, {W.shape[-2:]}."
         )
 
-    if functions:
+    if functions and include_boundary:
+        excluded_projector = 0.0
+        for F, level in zip(functions, level_sets):
+            eigenvalues, eigenvectors = np.linalg.eigh(-1j * F)
+            closest_index = np.argmin(np.abs(eigenvalues - level))
+            closest_eigenvalue = eigenvalues[closest_index]
+            boundary = np.isclose(eigenvalues, closest_eigenvalue)
+            excluded = (eigenvalues > closest_eigenvalue) & ~boundary
+            U = eigenvectors[:, excluded]
+            excluded_projector = excluded_projector + U @ U.conj().T
+    elif functions:
         excluded_projector = spectral_matrix(
             functions,
             level_sets,
@@ -629,7 +842,13 @@ def project_domain(W, functions, level_sets, prescribed_trace=0.0):
     trace = np.trace(projected, axis1=-2, axis2=-1)
     target_trace = 0.0 if prescribed_trace == 0.0 else 1j * prescribed_trace
     trace_shift = np.asarray((target_trace - trace) / domain_rank)
-    return projected + trace_shift[..., None, None] * domain_projector
+    projected = projected + trace_shift[..., None, None] * domain_projector
+    if min_eigenvalue_magnitude is not None:
+        projected = _floor_projected_eigenvalues(
+            projected,
+            min_eigenvalue_magnitude,
+        )
+    return projected
 
 
 # Constraint-aware plotting

@@ -6,6 +6,8 @@ dependencies:
   - pip
   - numpy
   - scipy
+  - fonttools
+  - contourpy
   - numba
   - h5py
   - appdirs
@@ -21,5 +23,3 @@ dependencies:
   - ducc0
   - libblas=*=*_newaccelerate # [arm64 and osx]
   - libblas=*=*mkl # [x86_64]
-  - pip:
-    - https://github.com/klasmodin/quflow/archive/master.zip
