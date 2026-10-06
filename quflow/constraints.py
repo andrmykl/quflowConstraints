@@ -13,13 +13,14 @@ import scipy.sparse.linalg as spla
 
 import quflow as qf
 
-from .svg_domain import import_svg_domain
+from .svg_domain import import_svg_blobs, import_svg_domain
 
 
 __all__ = [
     "CommutatorPoissonSolver",
     "ConstraintPlotter",
     "constraint_matrix",
+    "import_svg_blobs",
     "import_svg_domain",
     "largest_eigenvector",
     "plotter",
